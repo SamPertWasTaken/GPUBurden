@@ -1,3 +1,6 @@
+use std::time::Instant;
+
+use noise::{NoiseFn, Perlin};
 use smithay_client_toolkit::{compositor::{CompositorHandler, CompositorState}, delegate_compositor, delegate_layer, delegate_output, delegate_registry, delegate_seat, delegate_shm, output::{OutputHandler, OutputState}, registry::{ProvidesRegistryState, RegistryState}, registry_handlers, seat::{SeatHandler, SeatState}, shell::{wlr_layer::{KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface}, WaylandSurface}, shm::{slot::SlotPool, Shm, ShmHandler}};
 use wayland_client::{globals::registry_queue_init, protocol::wl_shm, Connection, QueueHandle};
 
@@ -8,6 +11,9 @@ pub struct WaylandState {
     shm: Shm,
     pool: SlotPool,
     layer: LayerSurface,
+    noise: Perlin,
+    noise_z: f64,
+    last_frame_time: Instant,
 
     registry_state: RegistryState,
     seat_state: SeatState,
@@ -80,14 +86,36 @@ impl WaylandState {
         let stride = width_int * 4;
 
         let (buffer, canvas) = self.pool.create_buffer(width_int, height_int, stride, wl_shm::Format::Argb8888).expect("Failed to create buffer on draw.");
+
+        // figure out the noise movement 
+        let frame_time = self.last_frame_time.elapsed().as_nanos();
+        let movement = frame_time as f64 / 1000000.0;
+        self.noise_z += movement;
+
         canvas.chunks_exact_mut(4).enumerate().for_each(|(index, chunk)| {
             let width_usize = usize::try_from(self.width).expect("width to usize failed");
             let x = u32::try_from(index % width_usize).expect("x to u32 failed");
             let y = u32::try_from(index / width_usize).expect("y to u32 failed");
 
-            let r = f32::round(255_f32 * (x as f32 / width as f32)) as u32;
-            let g = f32::round(255_f32 * (y as f32 / height as f32)) as u32;
-            let b = 0; // sorry blue lovers :(
+            let noise_size_x = 1920.0 / 32.0;
+            let noise_size_y = 1080.0 / 32.0;
+            let noise_x = (x as f64 / width as f64) * noise_size_x;
+            let noise_y = (y as f64 / height as f64) * noise_size_y;
+
+            // noise math stuff 
+            // thanks https://github.com/Razaekel/noise-rs/issues/354 for making me realize im stupid 
+            // distortion algorithm provided by https://gamedev.stackexchange.com/a/162460
+            let strength = 1.0;
+            let distorted_x: f64 = self.noise.get([noise_x + 0.6335, noise_y + 0.6241, self.noise_z]) * strength;
+            let distorted_y: f64 = self.noise.get([noise_x - 0.2316, noise_y - 0.5251, self.noise_z]) * strength;
+            let value: f64 = self.noise.get([(noise_x + 0.1) + distorted_x, (noise_y + 0.1) + distorted_y]);
+
+            let value_normalized: f64 = (value + 1.0) / 2.0;
+            let rgb_value: u32 = (value_normalized * 255_f64).round() as u32;
+
+            let r = rgb_value;
+            let g = rgb_value;
+            let b = rgb_value;
             let color: u32 = (r << 16) + (g << 8) + b;
 
             let array: &mut [u8; 4] = chunk.try_into().unwrap();
@@ -98,6 +126,8 @@ impl WaylandState {
         self.layer.wl_surface().frame(qh, self.layer.wl_surface().clone());
         buffer.attach_to(self.layer.wl_surface()).expect("Failed to attach to buffer");
         self.layer.commit();
+
+        self.last_frame_time = Instant::now();
     }
 }
 
@@ -127,6 +157,8 @@ pub fn start() {
     layer.commit();
     let pool = SlotPool::new((width * height * 4) as usize, &shm).expect("Failed to create pool");
 
+    let noise = Perlin::new(2903568236);
+
     let mut state = WaylandState {
         width,
         height,
@@ -134,6 +166,9 @@ pub fn start() {
         shm,
         pool,
         layer,
+        noise,
+        noise_z: 0.0,
+        last_frame_time: Instant::now(),
         
         registry_state: RegistryState::new(&globals),
         seat_state: SeatState::new(&globals, &qh),
