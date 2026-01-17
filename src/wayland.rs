@@ -4,6 +4,8 @@ use noise::{NoiseFn, Perlin};
 use smithay_client_toolkit::{compositor::{CompositorHandler, CompositorState}, delegate_compositor, delegate_layer, delegate_output, delegate_registry, delegate_seat, delegate_shm, output::{OutputHandler, OutputState}, registry::{ProvidesRegistryState, RegistryState}, registry_handlers, seat::{SeatHandler, SeatState}, shell::{wlr_layer::{KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface}, WaylandSurface}, shm::{slot::SlotPool, Shm, ShmHandler}};
 use wayland_client::{globals::registry_queue_init, protocol::wl_shm, Connection, QueueHandle};
 
+use crate::{color::Color, color_ramp::ColorRamp};
+
 pub struct WaylandState {
     width: u32,
     height: u32,
@@ -14,6 +16,7 @@ pub struct WaylandState {
     noise: Perlin,
     noise_z: f64,
     last_frame_time: Instant,
+    color_ramp: ColorRamp,
 
     registry_state: RegistryState,
     seat_state: SeatState,
@@ -109,17 +112,12 @@ impl WaylandState {
             let distorted_x: f64 = self.noise.get([noise_x + 0.6335, noise_y + 0.6241, self.noise_z]) * strength;
             let distorted_y: f64 = self.noise.get([noise_x - 0.2316, noise_y - 0.5251, self.noise_z]) * strength;
             let value: f64 = self.noise.get([(noise_x + 0.1) + distorted_x, (noise_y + 0.1) + distorted_y]);
+            let value_normalized: f32 = ((value + 1.0) / 2.0) as f32;
 
-            let value_normalized: f64 = (value + 1.0) / 2.0;
-            let rgb_value: u32 = (value_normalized * 255_f64).round() as u32;
-
-            let r = rgb_value;
-            let g = rgb_value;
-            let b = rgb_value;
-            let color: u32 = (r << 16) + (g << 8) + b;
-
+            let color = self.color_ramp.get_color_at_point(value_normalized);
+            let wayland_color = color.get_wayland_color();
             let array: &mut [u8; 4] = chunk.try_into().unwrap();
-            *array = color.to_le_bytes();
+            *array = wayland_color.to_le_bytes();
         });
 
         self.layer.wl_surface().damage_buffer(0, 0, width as i32, height as i32);
@@ -158,6 +156,10 @@ pub fn start() {
     let pool = SlotPool::new((width * height * 4) as usize, &shm).expect("Failed to create pool");
 
     let noise = Perlin::new(2903568236);
+    let color_ramp = ColorRamp::new(vec![
+        Color::new(0, 0, 0, 255),
+        Color::new(100, 58, 144, 255),
+    ]);
 
     let mut state = WaylandState {
         width,
@@ -169,6 +171,7 @@ pub fn start() {
         noise,
         noise_z: 0.0,
         last_frame_time: Instant::now(),
+        color_ramp,
         
         registry_state: RegistryState::new(&globals),
         seat_state: SeatState::new(&globals, &qh),
