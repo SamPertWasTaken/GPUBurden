@@ -1,3 +1,5 @@
+mod wayland;
+
 fn main() {
-    println!("Hello, world!");
+    wayland::start();
 }
