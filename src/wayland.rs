@@ -1,8 +1,9 @@
-use std::time::Instant;
+use std::{ptr::NonNull, time::Instant};
 
 use noise::{NoiseFn, Perlin};
 use smithay_client_toolkit::{compositor::{CompositorHandler, CompositorState}, delegate_compositor, delegate_layer, delegate_output, delegate_registry, delegate_seat, delegate_shm, output::{OutputHandler, OutputState}, registry::{ProvidesRegistryState, RegistryState}, registry_handlers, seat::{SeatHandler, SeatState}, shell::{wlr_layer::{KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface}, WaylandSurface}, shm::{slot::SlotPool, Shm, ShmHandler}};
-use wayland_client::{globals::registry_queue_init, protocol::wl_shm, Connection, QueueHandle};
+use wayland_client::{globals::registry_queue_init, protocol::{wl_shm, wl_surface::WlSurface}, Connection, Proxy, QueueHandle};
+use wgpu::{rwh::{RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle}, Backends, Instance, InstanceDescriptor, LoadOp, RenderPassColorAttachment, RenderPassDescriptor, RequestAdapterOptions, RequestAdapterOptionsBase, StoreOp, SurfaceConfiguration, SurfaceTargetUnsafe, TextureViewDescriptor};
 
 use crate::{color::Color, color_ramp::ColorRamp};
 
@@ -10,13 +11,10 @@ pub struct WaylandState {
     width: u32,
     height: u32,
     close: bool,
-    shm: Shm,
-    pool: SlotPool,
-    layer: LayerSurface,
-    noise: Perlin,
-    noise_z: f64,
-    last_frame_time: Instant,
-    color_ramp: ColorRamp,
+    wgpu_surface: wgpu::Surface<'static>,
+    wgpu_adapter: wgpu::Adapter,
+    wgpu_device: wgpu::Device,
+    wgpu_queue: wgpu::Queue,
 
     registry_state: RegistryState,
     seat_state: SeatState,
@@ -52,6 +50,22 @@ impl LayerShellHandler for WaylandState {
     fn configure(&mut self, _conn: &wayland_client::Connection, qh: &QueueHandle<Self>, _layer: &LayerSurface, configure: smithay_client_toolkit::shell::wlr_layer::LayerSurfaceConfigure, _serial: u32) {
         self.width = configure.new_size.0;
         self.height = configure.new_size.1;
+        
+        // also heavily based off the wgpu example wayland-client-toolkit gives
+        let surface_capabilities = self.wgpu_surface.get_capabilities(&self.wgpu_adapter);
+        let surface_config = SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: surface_capabilities.formats[0],
+            view_formats: vec![surface_capabilities.formats[0]],
+            alpha_mode: wgpu::CompositeAlphaMode::Auto,
+            width: self.width,
+            height: self.height,
+            desired_maximum_frame_latency: 2,
+            present_mode: wgpu::PresentMode::Mailbox
+        };
+        self.wgpu_surface.configure(&self.wgpu_device, &surface_config);
+
+        // re-draw the frame
         self.draw(qh);
     }
 }
@@ -67,12 +81,6 @@ impl SeatHandler for WaylandState {
     fn remove_seat(&mut self, _conn: &wayland_client::Connection, _qh: &QueueHandle<Self>, _seat: wayland_client::protocol::wl_seat::WlSeat) {}
 }
 
-impl ShmHandler for WaylandState {
-    fn shm_state(&mut self) -> &mut Shm {
-        &mut self.shm
-    }
-}
-
 impl ProvidesRegistryState for WaylandState {
     fn registry(&mut self) -> &mut RegistryState {
         &mut self.registry_state
@@ -82,56 +90,34 @@ impl ProvidesRegistryState for WaylandState {
 
 impl WaylandState {
     pub fn draw(&mut self, qh: &QueueHandle<Self>) {
-        let width = self.width;
-        let height = self.height;
-        let width_int = i32::try_from(width).expect("selected height to i32 failed");
-        let height_int = i32::try_from(height).expect("height to i32 failed");
-        let stride = width_int * 4;
+        let texture = self.wgpu_surface.get_current_texture().expect("Failed to get next swapchain texture");
+        let texture_view = texture.texture.create_view(&TextureViewDescriptor::default());
 
-        let (buffer, canvas) = self.pool.create_buffer(width_int, height_int, stride, wl_shm::Format::Argb8888).expect("Failed to create buffer on draw.");
-
-        // figure out the noise movement 
-        let frame_time = self.last_frame_time.elapsed().as_nanos();
-        let movement = frame_time as f64 / 1000000.0;
-        self.noise_z += movement;
-
-        canvas.chunks_exact_mut(4).enumerate().for_each(|(index, chunk)| {
-            let width_usize = usize::try_from(self.width).expect("width to usize failed");
-            let x = u32::try_from(index % width_usize).expect("x to u32 failed");
-            let y = u32::try_from(index / width_usize).expect("y to u32 failed");
-
-            let noise_size_x = 1920.0 / 32.0;
-            let noise_size_y = 1080.0 / 32.0;
-            let noise_x = (x as f64 / width as f64) * noise_size_x;
-            let noise_y = (y as f64 / height as f64) * noise_size_y;
-
-            // noise math stuff 
-            // thanks https://github.com/Razaekel/noise-rs/issues/354 for making me realize im stupid 
-            // distortion algorithm provided by https://gamedev.stackexchange.com/a/162460
-            let strength = 1.0;
-            let distorted_x: f64 = self.noise.get([noise_x + 0.6335, noise_y + 0.6241, self.noise_z]) * strength;
-            let distorted_y: f64 = self.noise.get([noise_x - 0.2316, noise_y - 0.5251, self.noise_z]) * strength;
-            let value: f64 = self.noise.get([(noise_x + 0.1) + distorted_x, (noise_y + 0.1) + distorted_y]);
-            let value_normalized: f32 = ((value + 1.0) / 2.0) as f32;
-
-            let color = self.color_ramp.get_color_at_point(value_normalized);
-            let wayland_color = color.get_wayland_color();
-            let array: &mut [u8; 4] = chunk.try_into().unwrap();
-            *array = wayland_color.to_le_bytes();
-        });
-
-        self.layer.wl_surface().damage_buffer(0, 0, width as i32, height as i32);
-        self.layer.wl_surface().frame(qh, self.layer.wl_surface().clone());
-        buffer.attach_to(self.layer.wl_surface()).expect("Failed to attach to buffer");
-        self.layer.commit();
-
-        self.last_frame_time = Instant::now();
+        let mut encoder = self.wgpu_device.create_command_encoder(&Default::default());
+        {
+            let _renderpass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &texture_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: LoadOp::Clear(wgpu::Color::BLUE),
+                        store: StoreOp::Store
+                    }
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None
+            });
+        }
+        self.wgpu_queue.submit(Some(encoder.finish()));
+        texture.present();
     }
 }
 
 delegate_compositor!(WaylandState);
 delegate_output!(WaylandState);
-delegate_shm!(WaylandState);
 delegate_seat!(WaylandState);
 delegate_layer!(WaylandState);
 delegate_registry!(WaylandState);
@@ -143,35 +129,53 @@ pub fn start() {
 
     let compositor = CompositorState::bind(&globals, &qh).expect("Compositor does not support 'wl_compositor'");
     let layer_shell = LayerShell::bind(&globals, &qh).expect("Compositor does not support 'zwlr_layer_shell_v1'");
-    let shm = Shm::bind(&globals, &qh).expect("Compositor does not support `wl_shm`");
 
     // TODO
     let width: u32 = 1920;
     let height: u32 = 1080;
     let surface = compositor.create_surface(&qh);
-    let layer = layer_shell.create_layer_surface(&qh, surface, Layer::Background, Some("noisy-wallpaper"), None);
+    let layer = layer_shell.create_layer_surface(&qh, surface.clone(), Layer::Background, Some("noisy-wallpaper"), None);
     layer.set_keyboard_interactivity(KeyboardInteractivity::None);
     layer.set_size(width, height);
     layer.commit();
-    let pool = SlotPool::new((width * height * 4) as usize, &shm).expect("Failed to create pool");
 
-    let noise = Perlin::new(2903568236);
-    let color_ramp = ColorRamp::new(vec![
-        Color::new(0, 0, 0, 255),
-        Color::new(100, 58, 144, 255),
-    ]);
+    // setup web gpu 
+    // mostly based off of https://github.com/Smithay/client-toolkit/blob/master/examples/wgpu.rs
+    let wgpu_instance = Instance::new(&InstanceDescriptor {
+        backends: Backends::all(),
+        ..Default::default()
+    });
+    let raw_display_handle = RawDisplayHandle::Wayland(WaylandDisplayHandle::new(
+        NonNull::new(conn.backend().display_ptr() as *mut _).expect("Failed to create display handle for wgpu.")
+    ));
+    let raw_window_handle = RawWindowHandle::Wayland(WaylandWindowHandle::new(
+        NonNull::new(surface.id().as_ptr() as *mut _).expect("Failed to create window handle for wgpu.")
+    ));
+
+    let wgpu_surface = unsafe { 
+        // TODO not sure why this has to be unsafe?
+        wgpu_instance.create_surface_unsafe(SurfaceTargetUnsafe::RawHandle {
+            raw_display_handle,
+            raw_window_handle
+        }).expect("Failed to create wgpu surface.")
+    };
+
+    // Adapter 
+    let wgpu_adapter = pollster::block_on(wgpu_instance.request_adapter(&RequestAdapterOptions {
+        compatible_surface: Some(&wgpu_surface),
+        ..Default::default()
+    })).expect("Wgpu failed to find a compatible adapter.");
+
+    let (wgpu_device, wgpu_queue) = pollster::block_on(wgpu_adapter.request_device(&Default::default())).expect("Failed to request a wgpu device.");
 
     let mut state = WaylandState {
         width,
         height,
         close: false,
-        shm,
-        pool,
-        layer,
-        noise,
-        noise_z: 0.0,
-        last_frame_time: Instant::now(),
-        color_ramp,
+        wgpu_surface,
+        wgpu_adapter,
+        wgpu_device,
+        wgpu_queue,
         
         registry_state: RegistryState::new(&globals),
         seat_state: SeatState::new(&globals, &qh),
@@ -179,5 +183,11 @@ pub fn start() {
     };
     loop {
         event_queue.blocking_dispatch(&mut state).unwrap();
+
+        if state.close {
+            break;
+        }
     }
+
+    drop(state.wgpu_surface);
 }
