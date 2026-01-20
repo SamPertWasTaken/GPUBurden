@@ -3,6 +3,21 @@
 version = 4
 
 [[package]]
+name = "GPUBurden"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "noise",
+ "pollster",
+ "rand 0.9.2",
+ "smithay-client-toolkit",
+ "wayland-backend",
+ "wayland-client",
+ "wesl",
+ "wgpu",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -921,21 +936,6 @@ dependencies = [
  "num-traits",
  "rand 0.8.5",
  "rand_xorshift",
-]
-
-[[package]]
-name = "noisy-wallpaper"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "noise",
- "pollster",
- "rand 0.9.2",
- "smithay-client-toolkit",
- "wayland-backend",
- "wayland-client",
- "wesl",
- "wgpu",
 ]
 
 [[package]]

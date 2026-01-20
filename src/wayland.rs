@@ -267,7 +267,7 @@ pub fn start() {
     let width: u32 = 1920;
     let height: u32 = 1080;
     let surface = compositor.create_surface(&qh);
-    let layer = layer_shell.create_layer_surface(&qh, surface.clone(), Layer::Background, Some("noisy-wallpaper"), None);
+    let layer = layer_shell.create_layer_surface(&qh, surface.clone(), Layer::Background, Some("gpuburden-wallpaper"), None);
     layer.set_keyboard_interactivity(KeyboardInteractivity::None);
     layer.set_size(width, height);
     layer.commit();
