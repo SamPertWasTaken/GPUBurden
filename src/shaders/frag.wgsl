@@ -20,7 +20,7 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     var value: f32 = 0;
     var freq: f32 = 1;
     var noise_scale: f32 = 0.02;
-    for(var i = 0; i < 5; i++) {
+    for(var i = 0; i < 2; i++) {
         let scaled_x = pos.x * noise_scale;
         let scaled_y = pos.y * noise_scale;
 
