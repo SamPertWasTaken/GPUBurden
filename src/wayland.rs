@@ -1,24 +1,40 @@
-use std::{ptr::NonNull, time::Instant};
+use std::{num::NonZero, ptr::NonNull};
 
-use noise::{NoiseFn, Perlin};
-use smithay_client_toolkit::{compositor::{CompositorHandler, CompositorState}, delegate_compositor, delegate_layer, delegate_output, delegate_registry, delegate_seat, delegate_shm, output::{OutputHandler, OutputState}, registry::{ProvidesRegistryState, RegistryState}, registry_handlers, seat::{SeatHandler, SeatState}, shell::{wlr_layer::{KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface}, WaylandSurface}, shm::{slot::SlotPool, Shm, ShmHandler}};
-use wayland_client::{globals::registry_queue_init, protocol::{wl_shm, wl_surface::WlSurface}, Connection, Proxy, QueueHandle};
-use wgpu::{rwh::{RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle}, Backends, Instance, InstanceDescriptor, LoadOp, RenderPassColorAttachment, RenderPassDescriptor, RequestAdapterOptions, RequestAdapterOptionsBase, StoreOp, SurfaceConfiguration, SurfaceTargetUnsafe, TextureViewDescriptor};
-
-use crate::{color::Color, color_ramp::ColorRamp};
+use bytemuck::NoUninit;
+use rand::{rngs::ThreadRng, Rng};
+use smithay_client_toolkit::{compositor::{CompositorHandler, CompositorState}, delegate_compositor, delegate_layer, delegate_output, delegate_registry, delegate_seat, output::{OutputHandler, OutputState}, registry::{ProvidesRegistryState, RegistryState}, registry_handlers, seat::{SeatHandler, SeatState}, shell::{wlr_layer::{KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface}, WaylandSurface}};
+use wayland_client::{globals::registry_queue_init, Connection, Proxy, QueueHandle};
+use wgpu::{include_wgsl, rwh::{RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle}, util::{BufferInitDescriptor, DeviceExt}, Backends, BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType, BlendState, Buffer, ColorTargetState, ColorWrites, Face, FragmentState, FrontFace, Instance, InstanceDescriptor, LoadOp, MultisampleState, PipelineCompilationOptions, PipelineLayoutDescriptor, PolygonMode, PrimitiveState, PrimitiveTopology, RenderPassColorAttachment, RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor, RequestAdapterOptions, ShaderStages, StoreOp, SurfaceConfiguration, SurfaceTargetUnsafe, TextureViewDescriptor};
 
 pub struct WaylandState {
     width: u32,
     height: u32,
+    layer: LayerSurface,
+    rand: ThreadRng,
+
     close: bool,
+    frame: u32,
+
     wgpu_surface: wgpu::Surface<'static>,
     wgpu_adapter: wgpu::Adapter,
     wgpu_device: wgpu::Device,
     wgpu_queue: wgpu::Queue,
+    wgpu_pipeline: Option<RenderPipeline>,
+    wgpu_fragment_buffer: Option<Buffer>,
+    wgpu_bind_group: Option<BindGroup>,
+    wgpu_configured: bool,
 
     registry_state: RegistryState,
     seat_state: SeatState,
     output_state: OutputState,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, NoUninit)]
+struct FragmentInputBuffer {
+    screen_size: [u32; 2],
+    frame: u32,
+    seed: u32,
 }
 
 impl CompositorHandler for WaylandState {
@@ -50,7 +66,7 @@ impl LayerShellHandler for WaylandState {
     fn configure(&mut self, _conn: &wayland_client::Connection, qh: &QueueHandle<Self>, _layer: &LayerSurface, configure: smithay_client_toolkit::shell::wlr_layer::LayerSurfaceConfigure, _serial: u32) {
         self.width = configure.new_size.0;
         self.height = configure.new_size.1;
-        
+
         // also heavily based off the wgpu example wayland-client-toolkit gives
         let surface_capabilities = self.wgpu_surface.get_capabilities(&self.wgpu_adapter);
         let surface_config = SurfaceConfiguration {
@@ -65,6 +81,98 @@ impl LayerShellHandler for WaylandState {
         };
         self.wgpu_surface.configure(&self.wgpu_device, &surface_config);
 
+        // Shader stuff now 
+        // Credit for teaching me this part goes to https://sotrh.github.io/learn-wgpu/beginner/tutorial3-pipeline
+        let vertex_shader = self.wgpu_device.create_shader_module(include_wgsl!("shaders/vertex.wgsl"));
+        let fragment_shader = self.wgpu_device.create_shader_module(include_wgsl!("shaders/frag.wgsl"));
+
+        // bind groups 
+        // thanks to the wgpu matrix server for making me realize these can pass into to the fragment shader
+        let fragment_input_buffer = FragmentInputBuffer {
+            screen_size: [self.width, self.height],
+            frame: self.frame,
+            seed: self.rand.random(),
+        };
+        let wgpu_fragment_buffer = self.wgpu_device.create_buffer_init(&BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&[fragment_input_buffer]),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::UNIFORM,
+        });
+        let wgpu_bind_group_layout = self.wgpu_device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            entries: &[
+                BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Buffer { 
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: NonZero::new(std::mem::size_of::<FragmentInputBuffer>() as u64)
+                    },
+                    count: None
+                }
+            ],
+            label: None
+        });
+        let wgpu_bind_group = self.wgpu_device.create_bind_group(&BindGroupDescriptor {
+            label: None,
+            layout: &wgpu_bind_group_layout,
+            entries: &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu_fragment_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let pipeline_layout = self.wgpu_device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[&wgpu_bind_group_layout],
+            push_constant_ranges: &[]
+        });
+
+        let wgpu_pipeline = self.wgpu_device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: None,
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &vertex_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: PipelineCompilationOptions::default()
+            },
+            fragment: Some(FragmentState {
+                module: &fragment_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(ColorTargetState {
+                    format: surface_config.format,
+                    blend: Some(BlendState::REPLACE),
+                    write_mask: ColorWrites::ALL
+                })],
+                compilation_options: PipelineCompilationOptions::default()
+            }),
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: FrontFace::Ccw,
+                cull_mode: Some(Face::Back),
+                polygon_mode: PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false
+            },
+            depth_stencil: None,
+            multisample: MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false
+            },
+            multiview: None,
+            cache: None
+        });
+
+        self.wgpu_fragment_buffer = Some(wgpu_fragment_buffer);
+        self.wgpu_bind_group = Some(wgpu_bind_group);
+        self.wgpu_pipeline = Some(wgpu_pipeline);
+
+        self.wgpu_configured = true;
         // re-draw the frame
         self.draw(qh);
     }
@@ -75,8 +183,8 @@ impl SeatHandler for WaylandState {
         &mut self.seat_state
     }
 
-    fn new_capability(&mut self, _conn: &wayland_client::Connection, qh: &QueueHandle<Self>, seat: wayland_client::protocol::wl_seat::WlSeat, capability: smithay_client_toolkit::seat::Capability) {}
-    fn remove_capability(&mut self, _conn: &wayland_client::Connection, _qh: &QueueHandle<Self>, _seat: wayland_client::protocol::wl_seat::WlSeat, capability: smithay_client_toolkit::seat::Capability) {}
+    fn new_capability(&mut self, _conn: &wayland_client::Connection, _qh: &QueueHandle<Self>, _seat: wayland_client::protocol::wl_seat::WlSeat, _capability: smithay_client_toolkit::seat::Capability) {}
+    fn remove_capability(&mut self, _conn: &wayland_client::Connection, _qh: &QueueHandle<Self>, _seat: wayland_client::protocol::wl_seat::WlSeat, _capability: smithay_client_toolkit::seat::Capability) {}
     fn new_seat(&mut self, _conn: &wayland_client::Connection, _qh: &QueueHandle<Self>, _seat: wayland_client::protocol::wl_seat::WlSeat) {}
     fn remove_seat(&mut self, _conn: &wayland_client::Connection, _qh: &QueueHandle<Self>, _seat: wayland_client::protocol::wl_seat::WlSeat) {}
 }
@@ -93,9 +201,11 @@ impl WaylandState {
         let texture = self.wgpu_surface.get_current_texture().expect("Failed to get next swapchain texture");
         let texture_view = texture.texture.create_view(&TextureViewDescriptor::default());
 
+        self.frame += 1;
+
         let mut encoder = self.wgpu_device.create_command_encoder(&Default::default());
         {
-            let _renderpass = encoder.begin_render_pass(&RenderPassDescriptor {
+            let mut renderpass = encoder.begin_render_pass(&RenderPassDescriptor {
                 label: None,
                 color_attachments: &[Some(RenderPassColorAttachment {
                     view: &texture_view,
@@ -110,9 +220,32 @@ impl WaylandState {
                 timestamp_writes: None,
                 occlusion_query_set: None
             });
+
+            if self.wgpu_configured {
+                let pipeline = self.wgpu_pipeline.as_ref().expect("WGPU was configured but pipeline not set. Bug report this!");
+                // let bind_group = self.wgpu_bind_group.as_ref().expect("WGPU was configured but bind group not set. Bug report this!");
+
+                renderpass.set_pipeline(pipeline);
+                renderpass.set_bind_group(0, &self.wgpu_bind_group, &[]);
+                renderpass.draw(0..3, 0..1);
+            }
         }
+
+        if self.wgpu_configured {
+            let frag_buffer = self.wgpu_fragment_buffer.as_ref().expect("WGPU was configured but fragment input buffer not set. Bug report this!");
+            let fragment_input_buffer = FragmentInputBuffer {
+                screen_size: [self.width, self.height],
+                frame: self.frame,
+                seed: self.rand.random(),
+            };
+            self.wgpu_queue.write_buffer(frag_buffer, 0, bytemuck::cast_slice(&[fragment_input_buffer]));
+        }
+
         self.wgpu_queue.submit(Some(encoder.finish()));
         texture.present();
+
+        self.layer.wl_surface().frame(qh, self.layer.wl_surface().clone());
+        self.layer.commit();
     }
 }
 
@@ -167,15 +300,24 @@ pub fn start() {
     })).expect("Wgpu failed to find a compatible adapter.");
 
     let (wgpu_device, wgpu_queue) = pollster::block_on(wgpu_adapter.request_device(&Default::default())).expect("Failed to request a wgpu device.");
-
+    
     let mut state = WaylandState {
         width,
         height,
+        layer,
+        rand: rand::rng(),
         close: false,
+        frame: 0,
+
         wgpu_surface,
         wgpu_adapter,
         wgpu_device,
         wgpu_queue,
+        // below gets made in the wayland configure call 
+        wgpu_pipeline: None, 
+        wgpu_fragment_buffer: None,
+        wgpu_bind_group: None,
+        wgpu_configured: false,
         
         registry_state: RegistryState::new(&globals),
         seat_state: SeatState::new(&globals, &qh),
