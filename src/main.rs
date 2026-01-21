@@ -1,3 +1,4 @@
+mod renderer;
 mod wayland;
 
 fn main() {

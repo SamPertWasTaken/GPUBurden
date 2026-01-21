@@ -1,40 +1,30 @@
-use std::{num::NonZero, ptr::NonNull};
+use std::{collections::HashMap, ptr::NonNull};
 
-use bytemuck::NoUninit;
-use rand::{rngs::ThreadRng, Rng};
-use smithay_client_toolkit::{compositor::{CompositorHandler, CompositorState}, delegate_compositor, delegate_layer, delegate_output, delegate_registry, delegate_seat, output::{OutputHandler, OutputState}, registry::{ProvidesRegistryState, RegistryState}, registry_handlers, seat::{SeatHandler, SeatState}, shell::{wlr_layer::{KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface}, WaylandSurface}};
-use wayland_client::{globals::registry_queue_init, Connection, Proxy, QueueHandle};
-use wgpu::{include_wgsl, rwh::{RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle}, util::{BufferInitDescriptor, DeviceExt}, Backends, BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType, BlendState, Buffer, ColorTargetState, ColorWrites, Face, FragmentState, FrontFace, Instance, InstanceDescriptor, LoadOp, MultisampleState, PipelineCompilationOptions, PipelineLayoutDescriptor, PolygonMode, PrimitiveState, PrimitiveTopology, RenderPassColorAttachment, RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor, RequestAdapterOptions, ShaderStages, StoreOp, SurfaceConfiguration, SurfaceTargetUnsafe, TextureViewDescriptor};
+use smithay_client_toolkit::{compositor::{CompositorHandler, CompositorState}, delegate_compositor, delegate_layer, delegate_output, delegate_registry, delegate_seat, output::{OutputHandler, OutputState}, registry::{ProvidesRegistryState, RegistryState}, registry_handlers, seat::{SeatHandler, SeatState}, shell::{wlr_layer::{Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface}, WaylandSurface}};
+use wayland_client::{globals::registry_queue_init, protocol::{wl_output::WlOutput, wl_surface::WlSurface}, Connection, Proxy, QueueHandle};
+use wgpu::rwh::{RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle};
+
+use crate::renderer::Renderer;
 
 pub struct WaylandState {
-    width: u32,
-    height: u32,
-    layer: LayerSurface,
-    rand: ThreadRng,
-
     close: bool,
-    frame: u32,
+    started_drawing: bool,
+    targets: HashMap<String, OutputTarget>, // output name -> output target struct
 
-    wgpu_surface: wgpu::Surface<'static>,
-    wgpu_adapter: wgpu::Adapter,
-    wgpu_device: wgpu::Device,
-    wgpu_queue: wgpu::Queue,
-    wgpu_pipeline: Option<RenderPipeline>,
-    wgpu_fragment_buffer: Option<Buffer>,
-    wgpu_bind_group: Option<BindGroup>,
-    wgpu_configured: bool,
+    conn: Connection,
+    compositor: CompositorState,
+    layer_shell: LayerShell,
 
     registry_state: RegistryState,
     seat_state: SeatState,
     output_state: OutputState,
 }
-
-#[repr(C)]
-#[derive(Copy, Clone, NoUninit)]
-struct FragmentInputBuffer {
-    screen_size: [u32; 2],
-    frame: u32,
-    seed: u32,
+struct OutputTarget {
+    output: WlOutput,
+    layer: LayerSurface,
+    surface: WlSurface,
+    renderer: Option<Renderer>,
+    configured: bool
 }
 
 impl CompositorHandler for WaylandState {
@@ -53,7 +43,35 @@ impl OutputHandler for WaylandState {
         &mut self.output_state
     }
 
-    fn new_output(&mut self, _conn: &wayland_client::Connection, _qh: &QueueHandle<Self>, _output: wayland_client::protocol::wl_output::WlOutput) {}
+    fn new_output(&mut self, _conn: &wayland_client::Connection, qh: &QueueHandle<Self>, output: WlOutput) {
+        let output_info = match self.output_state.info(&output) {
+            Some(r) => r,
+            None => return, // don't bother with it
+        };
+
+        let name = match output_info.name {
+            Some(r) => r,
+            None => return,
+        };
+        let width: u32 = output_info.modes[0].dimensions.0 as u32;
+        let height: u32 = output_info.modes[0].dimensions.1 as u32;
+        let surface = self.compositor.create_surface(qh);
+        let layer = self.layer_shell.create_layer_surface(qh, surface.clone(), Layer::Background, Some(format!("gpuburden-{name}")), Some(&output));
+        layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+        layer.set_size(width, height);
+        layer.set_anchor(Anchor::LEFT | Anchor::TOP);
+        layer.commit();
+
+        let target = OutputTarget {
+            output,
+            layer,
+            surface,
+            renderer: None,
+            configured: false
+        };
+        println!("new output {name}");
+        self.targets.insert(name, target);
+    }
     fn update_output(&mut self, _conn: &wayland_client::Connection, _qh: &QueueHandle<Self>, _output: wayland_client::protocol::wl_output::WlOutput) {}
     fn output_destroyed(&mut self, _conn: &wayland_client::Connection, _qh: &QueueHandle<Self>, _output: wayland_client::protocol::wl_output::WlOutput) {}
 }
@@ -63,118 +81,48 @@ impl LayerShellHandler for WaylandState {
         self.close = true;
     }
 
-    fn configure(&mut self, _conn: &wayland_client::Connection, qh: &QueueHandle<Self>, _layer: &LayerSurface, configure: smithay_client_toolkit::shell::wlr_layer::LayerSurfaceConfigure, _serial: u32) {
-        self.width = configure.new_size.0;
-        self.height = configure.new_size.1;
+    fn configure(&mut self, _conn: &wayland_client::Connection, qh: &QueueHandle<Self>, layer: &LayerSurface, configure: smithay_client_toolkit::shell::wlr_layer::LayerSurfaceConfigure, _serial: u32) {
+        for target in &mut self.targets {
+            if target.1.layer != *layer {
+                continue
+            }
 
-        // also heavily based off the wgpu example wayland-client-toolkit gives
-        let surface_capabilities = self.wgpu_surface.get_capabilities(&self.wgpu_adapter);
-        let surface_config = SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: surface_capabilities.formats[0],
-            view_formats: vec![surface_capabilities.formats[0]],
-            alpha_mode: wgpu::CompositeAlphaMode::Auto,
-            width: self.width,
-            height: self.height,
-            desired_maximum_frame_latency: 2,
-            present_mode: wgpu::PresentMode::Mailbox
-        };
-        self.wgpu_surface.configure(&self.wgpu_device, &surface_config);
-
-        // Shader stuff now 
-        // Credit for teaching me this part goes to https://sotrh.github.io/learn-wgpu/beginner/tutorial3-pipeline
-        let vertex_shader = self.wgpu_device.create_shader_module(include_wgsl!("shaders/vertex.wgsl"));
-        let fragment_shader = self.wgpu_device.create_shader_module(include_wgsl!("shaders/frag.wgsl"));
-
-        // bind groups 
-        // thanks to the wgpu matrix server for making me realize these can pass into to the fragment shader
-        let fragment_input_buffer = FragmentInputBuffer {
-            screen_size: [self.width, self.height],
-            frame: self.frame,
-            seed: self.rand.random(),
-        };
-        let wgpu_fragment_buffer = self.wgpu_device.create_buffer_init(&BufferInitDescriptor {
-            label: None,
-            contents: bytemuck::cast_slice(&[fragment_input_buffer]),
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::UNIFORM,
-        });
-        let wgpu_bind_group_layout = self.wgpu_device.create_bind_group_layout(&BindGroupLayoutDescriptor {
-            entries: &[
-                BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: ShaderStages::FRAGMENT,
-                    ty: BindingType::Buffer { 
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: NonZero::new(std::mem::size_of::<FragmentInputBuffer>() as u64)
-                    },
-                    count: None
-                }
-            ],
-            label: None
-        });
-        let wgpu_bind_group = self.wgpu_device.create_bind_group(&BindGroupDescriptor {
-            label: None,
-            layout: &wgpu_bind_group_layout,
-            entries: &[
-                BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu_fragment_buffer.as_entire_binding(),
+            let target = target.1;
+            let info = self.output_state.info(&target.output).expect("Failed to get info for display.");
+            let mut width = configure.new_size.0;
+            let mut height = configure.new_size.1;
+            match info.transform {
+                wayland_client::protocol::wl_output::Transform::_90 | wayland_client::protocol::wl_output::Transform::_270 |
+                wayland_client::protocol::wl_output::Transform::Flipped90 | wayland_client::protocol::wl_output::Transform::Flipped270 => {
+                    width = configure.new_size.1;
+                    height = configure.new_size.0;
                 },
-            ],
-        });
+                _ => {}
+            }
 
-        let pipeline_layout = self.wgpu_device.create_pipeline_layout(&PipelineLayoutDescriptor {
-            label: None,
-            bind_group_layouts: &[&wgpu_bind_group_layout],
-            push_constant_ranges: &[]
-        });
+            if target.configured {
+                println!("configure called on already-configed monitor {}", info.name.unwrap_or("unknown display name".to_string()));
+                return;
+            }
 
-        let wgpu_pipeline = self.wgpu_device.create_render_pipeline(&RenderPipelineDescriptor {
-            label: None,
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &vertex_shader,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: PipelineCompilationOptions::default()
-            },
-            fragment: Some(FragmentState {
-                module: &fragment_shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(ColorTargetState {
-                    format: surface_config.format,
-                    blend: Some(BlendState::REPLACE),
-                    write_mask: ColorWrites::ALL
-                })],
-                compilation_options: PipelineCompilationOptions::default()
-            }),
-            primitive: PrimitiveState {
-                topology: PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: FrontFace::Ccw,
-                cull_mode: Some(Face::Back),
-                polygon_mode: PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false
-            },
-            depth_stencil: None,
-            multisample: MultisampleState {
-                count: 1,
-                mask: !0,
-                alpha_to_coverage_enabled: false
-            },
-            multiview: None,
-            cache: None
-        });
-
-        self.wgpu_fragment_buffer = Some(wgpu_fragment_buffer);
-        self.wgpu_bind_group = Some(wgpu_bind_group);
-        self.wgpu_pipeline = Some(wgpu_pipeline);
-
-        self.wgpu_configured = true;
-        // re-draw the frame
-        self.draw(qh);
+            // setup renderer
+            let raw_display_handle = RawDisplayHandle::Wayland(WaylandDisplayHandle::new(
+                    NonNull::new(self.conn.backend().display_ptr() as *mut _).expect("Failed to create display handle for wgpu.")
+            ));
+            let raw_window_handle = RawWindowHandle::Wayland(WaylandWindowHandle::new(
+                    NonNull::new(target.surface.id().as_ptr() as *mut _).expect("Failed to create window handle for wgpu.")
+            ));
+            // TODO hardcoded for testing, remove this!
+            let mut renderer = Renderer::for_layer(raw_display_handle, raw_window_handle);
+            renderer.configure_surface(width, height);
+            target.renderer = Some(renderer);
+            target.configured = true;
+            println!("{} configured for {}x{}", info.name.unwrap_or("unknown display name".to_string()), width, height);
+        }
+        if !self.started_drawing {
+            self.draw(qh);
+            self.started_drawing = true;
+        }
     }
 }
 
@@ -198,54 +146,15 @@ impl ProvidesRegistryState for WaylandState {
 
 impl WaylandState {
     pub fn draw(&mut self, qh: &QueueHandle<Self>) {
-        let texture = self.wgpu_surface.get_current_texture().expect("Failed to get next swapchain texture");
-        let texture_view = texture.texture.create_view(&TextureViewDescriptor::default());
-
-        self.frame += 1;
-
-        let mut encoder = self.wgpu_device.create_command_encoder(&Default::default());
-        {
-            let mut renderpass = encoder.begin_render_pass(&RenderPassDescriptor {
-                label: None,
-                color_attachments: &[Some(RenderPassColorAttachment {
-                    view: &texture_view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations {
-                        load: LoadOp::Clear(wgpu::Color::BLUE),
-                        store: StoreOp::Store
-                    }
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None
-            });
-
-            if self.wgpu_configured {
-                let pipeline = self.wgpu_pipeline.as_ref().expect("WGPU was configured but pipeline not set. Bug report this!");
-                // let bind_group = self.wgpu_bind_group.as_ref().expect("WGPU was configured but bind group not set. Bug report this!");
-
-                renderpass.set_pipeline(pipeline);
-                renderpass.set_bind_group(0, &self.wgpu_bind_group, &[]);
-                renderpass.draw(0..3, 0..1);
+        for render_target in &mut self.targets {
+            let target = render_target.1;
+            if let Some(renderer) = &mut target.renderer {
+                renderer.draw();
+                // target.layer.wl_surface().damage_buffer(0, 0, renderer.width as i32, renderer.height as i32);
             }
+            target.layer.wl_surface().frame(qh, target.layer.wl_surface().clone());
+            target.layer.commit();
         }
-
-        if self.wgpu_configured {
-            let frag_buffer = self.wgpu_fragment_buffer.as_ref().expect("WGPU was configured but fragment input buffer not set. Bug report this!");
-            let fragment_input_buffer = FragmentInputBuffer {
-                screen_size: [self.width, self.height],
-                frame: self.frame,
-                seed: self.rand.random(),
-            };
-            self.wgpu_queue.write_buffer(frag_buffer, 0, bytemuck::cast_slice(&[fragment_input_buffer]));
-        }
-
-        self.wgpu_queue.submit(Some(encoder.finish()));
-        texture.present();
-
-        self.layer.wl_surface().frame(qh, self.layer.wl_surface().clone());
-        self.layer.commit();
     }
 }
 
@@ -263,62 +172,15 @@ pub fn start() {
     let compositor = CompositorState::bind(&globals, &qh).expect("Compositor does not support 'wl_compositor'");
     let layer_shell = LayerShell::bind(&globals, &qh).expect("Compositor does not support 'zwlr_layer_shell_v1'");
 
-    // TODO
-    let width: u32 = 1920;
-    let height: u32 = 1080;
-    let surface = compositor.create_surface(&qh);
-    let layer = layer_shell.create_layer_surface(&qh, surface.clone(), Layer::Background, Some("gpuburden-wallpaper"), None);
-    layer.set_keyboard_interactivity(KeyboardInteractivity::None);
-    layer.set_size(width, height);
-    layer.commit();
-
-    // setup web gpu 
-    // mostly based off of https://github.com/Smithay/client-toolkit/blob/master/examples/wgpu.rs
-    let wgpu_instance = Instance::new(&InstanceDescriptor {
-        backends: Backends::all(),
-        ..Default::default()
-    });
-    let raw_display_handle = RawDisplayHandle::Wayland(WaylandDisplayHandle::new(
-        NonNull::new(conn.backend().display_ptr() as *mut _).expect("Failed to create display handle for wgpu.")
-    ));
-    let raw_window_handle = RawWindowHandle::Wayland(WaylandWindowHandle::new(
-        NonNull::new(surface.id().as_ptr() as *mut _).expect("Failed to create window handle for wgpu.")
-    ));
-
-    let wgpu_surface = unsafe { 
-        // TODO not sure why this has to be unsafe?
-        wgpu_instance.create_surface_unsafe(SurfaceTargetUnsafe::RawHandle {
-            raw_display_handle,
-            raw_window_handle
-        }).expect("Failed to create wgpu surface.")
-    };
-
-    // Adapter 
-    let wgpu_adapter = pollster::block_on(wgpu_instance.request_adapter(&RequestAdapterOptions {
-        compatible_surface: Some(&wgpu_surface),
-        ..Default::default()
-    })).expect("Wgpu failed to find a compatible adapter.");
-
-    let (wgpu_device, wgpu_queue) = pollster::block_on(wgpu_adapter.request_device(&Default::default())).expect("Failed to request a wgpu device.");
-    
     let mut state = WaylandState {
-        width,
-        height,
-        layer,
-        rand: rand::rng(),
         close: false,
-        frame: 0,
+        started_drawing: false,
+        targets: HashMap::new(),
 
-        wgpu_surface,
-        wgpu_adapter,
-        wgpu_device,
-        wgpu_queue,
-        // below gets made in the wayland configure call 
-        wgpu_pipeline: None, 
-        wgpu_fragment_buffer: None,
-        wgpu_bind_group: None,
-        wgpu_configured: false,
-        
+        conn,
+        compositor,
+        layer_shell,
+
         registry_state: RegistryState::new(&globals),
         seat_state: SeatState::new(&globals, &qh),
         output_state: OutputState::new(&globals, &qh),
@@ -331,5 +193,10 @@ pub fn start() {
         }
     }
 
-    drop(state.wgpu_surface);
+    for render_target in &mut state.targets {
+        let target = render_target.1;
+        if let Some(renderer) = target.renderer.take() {
+            renderer.free_surface();
+        }
+    }
 }
