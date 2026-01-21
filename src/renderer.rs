@@ -63,19 +63,21 @@ impl Renderer {
         let mut shader_code: ShaderModuleDescriptor = DEFAULT_SHADER;
         if let Some(config) = config {
             // read from the file 
-            match File::open(&config.shader) {
-                Ok(mut file) => {
-                    let mut contents = String::new();
-                    match file.read_to_string(&mut contents) {
-                        Ok(_) => shader_code = ShaderModuleDescriptor { 
-                            label: None,
-                            source: wgpu::ShaderSource::Wgsl(contents.into())
-                        },
-                        Err(e) => println!("failed to read {}: {e}", config.shader),
-                    };
-                },
-                Err(e) => println!("shader file {} not found: {e}", config.shader)
-            };
+            if config.shader.trim() != "default" {
+                match File::open(&config.shader) {
+                    Ok(mut file) => {
+                        let mut contents = String::new();
+                        match file.read_to_string(&mut contents) {
+                            Ok(_) => shader_code = ShaderModuleDescriptor { 
+                                label: None,
+                                source: wgpu::ShaderSource::Wgsl(contents.into())
+                            },
+                            Err(e) => println!("failed to read {}: {e}", config.shader),
+                        };
+                    },
+                    Err(e) => println!("shader file {} not found: {e}", config.shader)
+                };
+            }
         };
 
         Self {
