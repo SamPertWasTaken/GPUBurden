@@ -1,8 +1,12 @@
-use std::num::NonZero;
+use std::{fs::File, io::Read, num::NonZero};
 
 use bytemuck::NoUninit;
 use rand::{rngs::ThreadRng, Rng};
-use wgpu::{include_wgsl, rwh::{RawDisplayHandle, RawWindowHandle}, util::{BufferInitDescriptor, DeviceExt}, Adapter, Backends, BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType, BlendState, Buffer, ColorTargetState, ColorWrites, Device, Face, FragmentState, FrontFace, Instance, InstanceDescriptor, LoadOp, MultisampleState, PipelineCompilationOptions, PipelineLayoutDescriptor, PolygonMode, PrimitiveState, PrimitiveTopology, Queue, RenderPassColorAttachment, RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor, RequestAdapterOptions, ShaderStages, StoreOp, Surface, SurfaceConfiguration, SurfaceTargetUnsafe, TextureViewDescriptor};
+use wgpu::{include_wgsl, rwh::{RawDisplayHandle, RawWindowHandle}, util::{BufferInitDescriptor, DeviceExt}, Adapter, Backends, BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType, BlendState, Buffer, ColorTargetState, ColorWrites, Device, Face, FragmentState, FrontFace, Instance, InstanceDescriptor, LoadOp, MultisampleState, PipelineCompilationOptions, PipelineLayoutDescriptor, PolygonMode, PrimitiveState, PrimitiveTopology, Queue, RenderPassColorAttachment, RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor, RequestAdapterOptions, ShaderModuleDescriptor, ShaderStages, StoreOp, Surface, SurfaceConfiguration, SurfaceTargetUnsafe, TextureViewDescriptor};
+
+use crate::configuration::MonitorConfig;
+
+const DEFAULT_SHADER: ShaderModuleDescriptor<'_> = include_wgsl!("shaders/frag.wgsl");
 
 #[repr(C)]
 #[derive(Copy, Clone, NoUninit)]
@@ -26,6 +30,7 @@ pub struct Renderer {
     fragment_buffer: Option<Buffer>,
     bind_group: Option<BindGroup>,
     pipeline: Option<RenderPipeline>,
+    shader_code: ShaderModuleDescriptor<'static>,
 
     pub width: u32,
     pub height: u32,
@@ -34,7 +39,7 @@ pub struct Renderer {
     rand: ThreadRng
 }
 impl Renderer {
-    pub fn for_layer(raw_display_handle: RawDisplayHandle, raw_window_handle: RawWindowHandle) -> Self {
+    pub fn for_layer(raw_display_handle: RawDisplayHandle, raw_window_handle: RawWindowHandle, config: &Option<MonitorConfig>) -> Self {
         let instance = Instance::new(&InstanceDescriptor {
             backends: Backends::all(),
             ..Default::default()
@@ -55,6 +60,24 @@ impl Renderer {
 
         let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).expect("Failed to request a wgpu device.");
 
+        let mut shader_code: ShaderModuleDescriptor = DEFAULT_SHADER;
+        if let Some(config) = config {
+            // read from the file 
+            match File::open(&config.shader) {
+                Ok(mut file) => {
+                    let mut contents = String::new();
+                    match file.read_to_string(&mut contents) {
+                        Ok(_) => shader_code = ShaderModuleDescriptor { 
+                            label: None,
+                            source: wgpu::ShaderSource::Wgsl(contents.into())
+                        },
+                        Err(e) => println!("failed to read {}: {e}", config.shader),
+                    };
+                },
+                Err(e) => println!("shader file {} not found: {e}", config.shader)
+            };
+        };
+
         Self {
             surface,
             surface_config: None,
@@ -64,6 +87,7 @@ impl Renderer {
             fragment_buffer: None,
             bind_group: None,
             pipeline: None,
+            shader_code,
 
             width: 0,
             height: 0,
@@ -94,7 +118,7 @@ impl Renderer {
     fn reconfigure_pipeline(&mut self) {
         // Credit for teaching me this part goes to https://sotrh.github.io/learn-wgpu/beginner/tutorial3-pipeline
         let vertex_shader = self.device.create_shader_module(include_wgsl!("shaders/vertex.wgsl"));
-        let fragment_shader = self.device.create_shader_module(include_wgsl!("shaders/frag.wgsl"));
+        let fragment_shader = self.device.create_shader_module(self.shader_code.clone());
 
         // deal with the buffers first
         let fragment_input_buffer = FragmentInputBuffer {

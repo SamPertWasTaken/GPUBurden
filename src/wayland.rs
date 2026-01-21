@@ -4,12 +4,13 @@ use smithay_client_toolkit::{compositor::{CompositorHandler, CompositorState}, d
 use wayland_client::{globals::registry_queue_init, protocol::{wl_output::WlOutput, wl_surface::WlSurface}, Connection, Proxy, QueueHandle};
 use wgpu::rwh::{RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle};
 
-use crate::renderer::Renderer;
+use crate::{configuration::{Configuration, MonitorConfig}, renderer::Renderer};
 
 pub struct WaylandState {
     close: bool,
     started_drawing: bool,
     targets: HashMap<String, OutputTarget>, // output name -> output target struct
+    config: Option<Configuration>,
 
     conn: Connection,
     compositor: CompositorState,
@@ -53,6 +54,15 @@ impl OutputHandler for WaylandState {
             Some(r) => r,
             None => return,
         };
+
+        if let Some(config) = &self.config {
+            let monitor_config = config.monitor_config(&name);
+            if monitor_config.is_none() {
+                println!("output {name} skipped as it's not defined in the config.");
+                return;
+            }
+        }
+
         let width: u32 = output_info.modes[0].dimensions.0 as u32;
         let height: u32 = output_info.modes[0].dimensions.1 as u32;
         let surface = self.compositor.create_surface(qh);
@@ -89,6 +99,11 @@ impl LayerShellHandler for WaylandState {
 
             let target = target.1;
             let info = self.output_state.info(&target.output).expect("Failed to get info for display.");
+            let name = match info.name {
+                Some(r) => r,
+                None => return,
+            };
+
             let mut width = configure.new_size.0;
             let mut height = configure.new_size.1;
             match info.transform {
@@ -101,7 +116,7 @@ impl LayerShellHandler for WaylandState {
             }
 
             if target.configured {
-                println!("configure called on already-configed monitor {}", info.name.unwrap_or("unknown display name".to_string()));
+                println!("configure called on already-configed monitor {name}");
                 return;
             }
 
@@ -112,12 +127,16 @@ impl LayerShellHandler for WaylandState {
             let raw_window_handle = RawWindowHandle::Wayland(WaylandWindowHandle::new(
                     NonNull::new(target.surface.id().as_ptr() as *mut _).expect("Failed to create window handle for wgpu.")
             ));
-            // TODO hardcoded for testing, remove this!
-            let mut renderer = Renderer::for_layer(raw_display_handle, raw_window_handle);
+            let config: Option<MonitorConfig> = if let Some(config) = &self.config {
+                config.monitor_config(&name)
+            } else {
+                None
+            };
+            let mut renderer = Renderer::for_layer(raw_display_handle, raw_window_handle, &config);
             renderer.configure_surface(width, height);
             target.renderer = Some(renderer);
             target.configured = true;
-            println!("{} configured for {}x{}", info.name.unwrap_or("unknown display name".to_string()), width, height);
+            println!("{name} configured for {width}x{height}");
         }
         if !self.started_drawing {
             self.draw(qh);
@@ -164,7 +183,7 @@ delegate_seat!(WaylandState);
 delegate_layer!(WaylandState);
 delegate_registry!(WaylandState);
 
-pub fn start() {
+pub fn start(config: Option<Configuration>) {
     let conn = Connection::connect_to_env().expect("Unable to connect to a compositor.");
     let (globals, mut event_queue) = registry_queue_init(&conn).unwrap();
     let qh = event_queue.handle();
@@ -176,6 +195,7 @@ pub fn start() {
         close: false,
         started_drawing: false,
         targets: HashMap::new(),
+        config,
 
         conn,
         compositor,
