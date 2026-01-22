@@ -1,7 +1,3 @@
-fn rand(n: vec2<f32>) -> f32 {
-    return fract(sin(dot(n, vec2<f32>(12.8989, 4.1414))) * 43758.5453);
-}
-
 struct FragmentInput {
     screen_size: vec2<u32>,
     frame: u32,
@@ -68,6 +64,7 @@ fn srgb_to_rgb3(srgb_color: vec3<f32>) -> vec3<f32> {
 
 
 // Perlin Noise 
+// https://gist.github.com/munrocket/236ed5ba7e409b8bdf1ff6eca5dcdc39
 // MIT License. © Stefan Gustavson, Munrocket
 fn permute4(x: vec4f) -> vec4f { return ((x * 34. + 1.) * x) % vec4f(289.); }
 fn taylorInvSqrt4(r: vec4f) -> vec4f { return 1.79284291400159 - 0.85373472095314 * r; }
