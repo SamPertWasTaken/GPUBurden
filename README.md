@@ -4,7 +4,6 @@ A wayland wallpaper daemon that lets you run WGSL shader code as your wallpaper,
 https://github.com/user-attachments/assets/c9961067-5838-4748-8660-1d55ff539457
 
 ## Installing 
-Clone the repo and install via `cargo install --path .`
 GPU Burden is available on [crates.io](https://crates.io/crates/gpuburden);
 ```sh
 cargo install gpuburden
