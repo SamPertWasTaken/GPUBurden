@@ -6,6 +6,7 @@ struct FragmentInput {
 @group(0) @binding(0) var<uniform> fragment_input: FragmentInput;
 
 const SCROLL_SPEED: f32 = 0.00075;
+const NOISE_SCALE: f32 = 0.02;
 const COLOR_1: vec3f = vec3(22.0, 22.0, 22.0);
 const COLOR_2: vec3f = vec3(255.0, 168.0, 429.0);
 
@@ -17,7 +18,7 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 
     var value: f32 = 0;
     var freq: f32 = 1;
-    var noise_scale: f32 = 0.02;
+    var noise_scale: f32 = NOISE_SCALE;
     for(var i = 0; i < 2; i++) {
         let scaled_x = pos.x * noise_scale;
         let scaled_y = pos.y * noise_scale;
