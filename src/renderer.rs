@@ -6,7 +6,7 @@ use wgpu::{include_wgsl, rwh::{RawDisplayHandle, RawWindowHandle}, util::{Buffer
 
 use crate::configuration::MonitorConfig;
 
-const DEFAULT_SHADER: ShaderModuleDescriptor<'_> = include_wgsl!("shaders/frag.wgsl");
+const DEFAULT_SHADER: ShaderModuleDescriptor<'_> = include_wgsl!("../examples/default-shader.wgsl");
 
 #[repr(C)]
 #[derive(Copy, Clone, NoUninit)]

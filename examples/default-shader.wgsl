@@ -5,13 +5,15 @@ struct FragmentInput {
 };
 @group(0) @binding(0) var<uniform> fragment_input: FragmentInput;
 
-// Fragment shader
+const SCROLL_SPEED: f32 = 0.00075;
+const COLOR_1: vec3f = vec3(22.0, 22.0, 22.0);
+const COLOR_2: vec3f = vec3(255.0, 168.0, 429.0);
+
 @fragment
 fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     let size = fragment_input.screen_size;
 
-    let scroll_speed = 0.00075;
-    let speed_adjusted_frame = f32(fragment_input.frame) * scroll_speed;
+    let speed_adjusted_frame = f32(fragment_input.frame) * SCROLL_SPEED;
 
     var value: f32 = 0;
     var freq: f32 = 1;
@@ -29,29 +31,16 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         noise_scale += 0.05;
     }
 
-    // 99 56 143
-    // 22 22 22
-
-    var color = vec3<f32>(22.0, 22.0, 22.0);
+    var color = COLOR_1;
     if value > 0.5 {
-        color = vec3(99.0, 56.0, 143.0) * 3;
+        color = COLOR_2;
     }
     color = srgb_to_rgb3(color);
-
-    // let r = lerp(22.0, 92.0, value);
-    // let g = lerp(22.0, 92.0, value);
-    // let b = lerp(22.0, 92.0, value);
-
-    // let r = value * 255;
-    // let g = value * 128;
-    // let b = value * 120;
     return vec4<f32>(color / 255.0, 1.0);
 }
-fn lerp(a: f32, b: f32, t: f32) -> f32 {
-    return a + (b - a) * t;
-}
+
 fn srgb_to_rgb(srgb_color: f32) -> f32 {
-    return pow(((srgb_color / 255 + 0.055) / 1.055), 1);
+    return ((srgb_color / 255 + 0.055) / 1.055);
 }
 fn srgb_to_rgb3(srgb_color: vec3<f32>) -> vec3<f32> {
     return vec3(
@@ -60,7 +49,6 @@ fn srgb_to_rgb3(srgb_color: vec3<f32>) -> vec3<f32> {
         srgb_to_rgb(srgb_color.z)
     );
 }
-
 
 
 // Perlin Noise 
