@@ -5,6 +5,12 @@ https://github.com/user-attachments/assets/c9961067-5838-4748-8660-1d55ff539457
 
 ## Installing 
 Clone the repo and install via `cargo install --path .`
+GPU Burden is available on [crates.io](https://crates.io/crates/gpuburden);
+```sh
+cargo install gpuburden
+```
+
+Alternatively, just clone this repository and run `cargo install --path .`
 
 ## Usage
 Run the `gpuburden` binary like you would any other wallpaper daemon. For example with my compositor Hyprland;
