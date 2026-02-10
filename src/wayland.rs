@@ -63,8 +63,12 @@ impl OutputHandler for WaylandState {
             }
         }
 
-        let width: u32 = output_info.modes[0].dimensions.0 as u32;
-        let height: u32 = output_info.modes[0].dimensions.1 as u32;
+        let mut width: u32 = output_info.modes[0].dimensions.0 as u32;
+        let mut height: u32 = output_info.modes[0].dimensions.1 as u32;
+        if let Some(size) = output_info.logical_size {
+            width = size.0 as u32;
+            height = size.1 as u32;
+        }
         let surface = self.compositor.create_surface(qh);
         let layer = self.layer_shell.create_layer_surface(qh, surface.clone(), Layer::Background, Some(format!("gpuburden-{name}")), Some(&output));
         layer.set_keyboard_interactivity(KeyboardInteractivity::None);
@@ -79,7 +83,7 @@ impl OutputHandler for WaylandState {
             renderer: None,
             configured: false
         };
-        println!("new output {name}");
+        println!("new output {name} ({width}x{height})");
         self.targets.insert(name, target);
     }
     fn update_output(&mut self, _conn: &wayland_client::Connection, _qh: &QueueHandle<Self>, _output: wayland_client::protocol::wl_output::WlOutput) {}
@@ -106,13 +110,18 @@ impl LayerShellHandler for WaylandState {
 
             let mut width = configure.new_size.0;
             let mut height = configure.new_size.1;
-            match info.transform {
-                wayland_client::protocol::wl_output::Transform::_90 | wayland_client::protocol::wl_output::Transform::_270 |
-                wayland_client::protocol::wl_output::Transform::Flipped90 | wayland_client::protocol::wl_output::Transform::Flipped270 => {
-                    width = configure.new_size.1;
-                    height = configure.new_size.0;
-                },
-                _ => {}
+            if let Some(size) = info.logical_size {
+                width = size.0 as u32;
+                height = size.1 as u32;
+            } else {
+                match info.transform {
+                    wayland_client::protocol::wl_output::Transform::_90 | wayland_client::protocol::wl_output::Transform::_270 |
+                    wayland_client::protocol::wl_output::Transform::Flipped90 | wayland_client::protocol::wl_output::Transform::Flipped270 => {
+                        width = configure.new_size.1;
+                        height = configure.new_size.0;
+                    },
+                    _ => {}
+                }
             }
 
             if target.configured {
