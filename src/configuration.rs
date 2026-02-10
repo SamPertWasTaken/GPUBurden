@@ -9,7 +9,7 @@ pub struct MonitorConfig {
     pub shader: String
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct Configuration {
     monitors: Vec<MonitorConfig>
 }

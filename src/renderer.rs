@@ -212,14 +212,7 @@ impl Renderer {
     }
 
     pub fn draw(&mut self) {
-        let texture = match self.surface.get_current_texture() {
-            Ok(r) => r,
-            Err(e) => {
-                println!("Failed to get swapchain texture (is your GPU too busy?): {e}");
-                println!("Will try again on the next draw call...");
-                return;
-            },
-        };
+        let texture = self.surface.get_current_texture().expect("Failed to get swapchain texture (is your GPU too busy?)");
         let texture_view = texture.texture.create_view(&TextureViewDescriptor::default());
         self.frame += 1;
         let mut encoder = self.device.create_command_encoder(&Default::default());
